@@ -132,6 +132,7 @@ fn main() {
 
                         message.header.qr = 1;
                         message.header.ancount = 1;
+                        message.header.rcode = if message.header.opcode == 0 { 0 } else { 4 };
                         message.answer = answer;
                         let lookup = construct_lookup(message.question.name.as_bytes());
                         println!("Looking up '{}'", lookup.0);
