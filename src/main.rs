@@ -1,10 +1,10 @@
 // Uncomment this block to pass the first stage
 use std::net::UdpSocket;
-use packed_struct::PackingResult;
+use nom::Slice;
 use packed_struct::prelude::{packed_bits, PackedStruct};
 use packed_struct::types::Integer;
 
-#[derive(PackedStruct)]
+#[derive(PackedStruct, Debug)]
 #[packed_struct(bit_numbering = "msb0")]
 struct Header {
     #[packed_field(bits = "0..", endian = "msb")]
@@ -46,6 +46,40 @@ struct Header {
 
     #[packed_field(endian = "msb")]
     arcount: u16,
+
+}
+
+struct Question {
+    name: String,
+    _type: u16,
+    class: u16,
+}
+
+#[derive(PackedStruct, Debug)]
+#[packed_struct(bit_numbering = "msb0")]
+struct Message {
+    #[packed_field(bytes = "0..13", endian = "msb")]
+    header: Header,
+
+    #[packed_field(endian = "msb")]
+    question: [u8; 500],
+}
+
+fn construct_questions_from(bytes: &[u8]) -> String {
+    let mut lookup_parts = vec![];
+    let mut i: u8 = 0;
+    loop {
+        let length: u8 = bytes[i as usize];
+        if length == b'\0' {
+            break;
+        }
+
+        lookup_parts.push(String::from_utf8_lossy(&bytes[(i + 1) as usize..(length + 1) as usize]).to_string());
+
+        i += length;
+    }
+
+    lookup_parts.join(".")
 }
 
 fn main() {
@@ -60,36 +94,20 @@ fn main() {
             Ok((size, source)) => {
                 println!("Received {} bytes from {}", size, source);
 
-                // Header is ALWAYS 12 bytes long
-                let header = Header {
-                    id: 1234,
-                    qr: 1.into(),
-                    opcode: 0.into(),
-                    aa: 0.into(),
-                    tc: 0.into(),
-                    rd: 0.into(),
-                    ra: 0.into(),
-                    z: 0.into(),
-                    rcode: 0.into(),
-                    qdcount: 0,
-                    ancount: 0,
-                    nscount: 0,
-                    arcount: 0,
-                };
+                match Message::unpack(&buf) {
+                    Ok(mut message) => {
+                        message.header.qr = 1.into();
+                        let lookup = construct_questions_from(&message.question);
+                        println!("Received request for {}", lookup);
 
-                let packed_header = header.pack();
-                match packed_header {
-                    Ok(bytes) => {
-                        println!("Responding with {}", header);
                         udp_socket
-                            .send_to(&bytes, source)
+                            .send_to(&message.pack().unwrap(), source)
                             .expect("Failed to send response");
                     }
-                    Err(err) => {
-                        eprintln!("Error receiving data: {}", err);
-                        break;
+                    Err(_) => {
+                        continue;
                     }
-                }
+                };
             }
             Err(e) => {
                 eprintln!("Error receiving data: {}", e);
