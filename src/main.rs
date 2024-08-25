@@ -1,6 +1,7 @@
-use std::net::UdpSocket;
 use deku::prelude::*;
 use nom::AsBytes;
+use std::net::UdpSocket;
+use std::ptr::read;
 
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
 #[deku(endian = "big")]
@@ -47,10 +48,9 @@ struct Header {
 
 }
 
-#[derive(Debug, PartialEq, DekuRead, DekuWrite)]
-#[deku(endian = "big")]
+#[derive(Debug, PartialEq, DekuWrite)]
 struct Question {
-    #[deku(until = "|v: &u8| *v == b'\0'")]
+    #[deku(writer = "Question::write(deku::writer, &self.name)")]
     name: Vec<u8>,
 
     #[deku(bits = 16)]
@@ -60,10 +60,9 @@ struct Question {
     class: u16,
 }
 
-#[derive(Debug, PartialEq, DekuRead, DekuWrite)]
+#[derive(Debug, PartialEq, DekuWrite)]
 #[deku(endian = "big")]
 struct Answer {
-    #[deku(until = "|v: &u8| *v == b'\0'")]
     name: Vec<u8>,
 
     #[deku(bits = 16)]
@@ -87,26 +86,108 @@ struct Answer {
 struct Message {
     header: Header,
 
-    question: Question,
+    #[deku(reader = "Message::read_questions(deku::reader, (*header).qdcount)")]
+    question: Vec<Question>,
 
-    answer: Answer,
+    #[deku(
+        reader = "Message::default_answers()",
+        writer = "Message::write_answers(deku::writer, &question)"
+    )]
+    answer: Vec<Answer>,
 }
 
-fn construct_lookup(bytes: &[u8]) -> (String, u8) {
-    let mut lookup_parts = vec![];
-    let mut i: u8 = 0;
-    loop {
-        let length: u8 = bytes[i as usize];
-        if length == b'\0' {
-            break;
-        }
 
-        lookup_parts.push(String::from_utf8_lossy(&bytes[(i + 1) as usize..(i + length + 1) as usize]).to_string());
+impl Question {
+    fn write<W: std::io::Write>(writer: &mut Writer<W>, bytes: &Vec<u8>) -> Result<(), DekuError> {
+        let encoded = encode_lookup_to_dns(bytes);
+        encoded.to_writer(writer, ())
+    }
+}
 
-        i += length + 1;
+impl Message {
+    fn read_questions<R: std::io::Read>(reader: &mut Reader<R>, qdcount: u16) -> Result<Vec<Question>, DekuError> {
+        let questions: Vec<Question>;
+
+        let bits_read = reader.bits_read;
+
+        let unwrapped = &reader.read_bits(500).unwrap().unwrap();
+        let bytes_slice = unwrapped.as_raw_slice();
+        questions = construct_lookups(bytes_slice, bits_read / 8, qdcount);
+        Ok(questions)
     }
 
-    (lookup_parts.join("."), i)
+    fn default_answers() -> Result<Vec<Answer>, DekuError> {
+        Ok(Vec::new())
+    }
+
+    fn write_answers<W: std::io::Write>(writer: &mut Writer<W>, questions: &Vec<Question>) -> Result<(), DekuError> {
+        let mut answers = Vec::with_capacity(questions.len());
+
+        for q in questions {
+            let answer = Answer {
+                name: encode_lookup_to_dns(&q.name),
+                _type: 1,
+                class: 1,
+                ttl: 60,
+                length: 4,
+                data: vec!(0x08, 0x08, 0x08, 0x08),
+            };
+            answers.push(answer);
+        }
+
+        answers.to_writer(writer, ())
+    }
+}
+
+fn encode_lookup_to_dns(bytes: &Vec<u8>) -> Vec<u8> {
+    let dns = String::from_utf8(bytes.to_owned()).unwrap();
+    let split = dns.split('.');
+    let mut encoded = Vec::new();
+    for part in split {
+        encoded.push(part.len() as u8);
+        encoded.extend(part.as_bytes());
+    }
+    encoded.push(b'\0');
+    encoded
+}
+
+
+fn construct_lookups(bytes: &[u8], read_so_far: usize, qdcount: u16) -> Vec<Question> {
+    let mut lookup_parts = "".to_owned();
+    let mut lookups = Vec::new();
+
+    let mut i: u8 = 0;
+    for _ in 0..qdcount {
+        let mut length: u8;
+        loop {
+            length = bytes[i as usize];
+
+            if length == 0b00000000 {
+                let question = Question {
+                    name: lookup_parts[0..lookup_parts.len() - 1].to_owned().into_bytes(),
+                    _type: ((bytes[i as usize + 2] as u16) << 8) | bytes[i as usize + 1] as u16,
+                    class: ((bytes[i as usize + 4] as u16) << 8) | bytes[i as usize + 3] as u16,
+                };
+
+                lookups.push(question);
+                lookup_parts = "".to_owned();
+                i += 5;
+                break;
+            }
+
+            if length == 0b11000000 {
+                i = bytes[(i + 1) as usize] - read_so_far as u8;
+                continue;
+            }
+
+            lookup_parts.push_str(String::from_utf8_lossy(&bytes[(i + 1) as usize..(i + length + 1) as usize]).as_ref());
+            lookup_parts.push('.');
+
+            i += length + 1;
+        }
+    }
+
+    lookups
 }
 
 fn main() {
@@ -117,25 +198,14 @@ fn main() {
 
     loop {
         match udp_socket.recv_from(&mut buf) {
-            Ok((size, source)) => {
+            Ok((_, source)) => {
                 match Message::from_bytes((&buf, 0)) {
                     Ok(result) => {
                         let mut message = result.1;
-                        let answer = Answer {
-                            name: message.question.name.to_owned(),
-                            _type: 1,
-                            class: 1,
-                            ttl: 60,
-                            length: 4,
-                            data: vec!(0x08, 0x08, 0x08, 0x08),
-                        };
 
                         message.header.qr = 1;
-                        message.header.ancount = 1;
+                        message.header.ancount = 2;
                         message.header.rcode = if message.header.opcode == 0 { 0 } else { 4 };
-                        message.answer = answer;
-                        let lookup = construct_lookup(message.question.name.as_bytes());
-                        println!("Looking up '{}'", lookup.0);
 
                         udp_socket
                             .send_to(message.to_bytes().unwrap().as_bytes(), source)
